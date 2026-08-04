@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 
-class peg_prediction_model():
+class PegPredictionModel():
     def __init__(self):
         self.new_column_lists = [
             '机构估值折价', '机构置信区间', '机构预测的未来一年归母净利润下限', '机构预测的未来一年归母净利润上限',
@@ -11,18 +11,15 @@ class peg_prediction_model():
             'PEG=0.8时的股价预测值', 'PEG=1时的股价预测值', 'PEG=1.2时的股价预测值', '备注'
         ]
 
-    def main(self, input_dir, input_file, input_sheet, output_dir, output_file, output_sheet):
-        df = pd.read_excel(f"{input_dir}\\{input_file}", sheet_name=input_sheet, header=0)
+    def main(self, df):
         df[self.new_column_lists] = df.apply(self.apply_wrapper, axis=1)
-        df.to_excel(f"{output_dir}\\{output_file}", sheet_name=output_sheet, index=False)
+        return df
 
     def process_rows(self, row_df):
         """
         核心处理逻辑（均值回归衰减模型 + 全修正 + 三级增速预警）
         """
         stock_name = row_df["股票名称"].iloc[0]
-        # N为非预测值，即实际的repo值；Y为预测值，即仅预估的值
-        if_repo_published = row_df["TTM1利润是否为预测值"].iloc[0]
         current_quarter = int(row_df["当前季度"].iloc[0])
 
         # ---------- 1. 提取历史季度数据 ----------
@@ -290,14 +287,3 @@ class peg_prediction_model():
     def apply_wrapper(self, row_series):
         row_df = row_series.to_frame().T
         return self.process_rows(row_df)
-
-
-if __name__ == "__main__":
-    INPUT_DIR = "E:\\BaiduSyncdisk\\IntegratedKM\\经济学\\股市投资建模"
-    INPUT_FILE = "综合PE估值法估值.xlsx"
-    INPUT_SHEET = "综合PE估值法估值"
-    OUTPUT_DIR = "E:\\BaiduSyncdisk\\IntegratedKM\\经济学\\股市投资建模"
-    OUTPUT_FILE = "综合PE估值法估值_结果.xlsx"
-    OUTPUT_SHEET = INPUT_SHEET
-    peg_model = peg_prediction_model()
-    peg_model.main(INPUT_DIR, INPUT_FILE, INPUT_SHEET, OUTPUT_DIR, OUTPUT_FILE, OUTPUT_SHEET)
