@@ -1,38 +1,47 @@
 # -*- coding: utf-8 -*-
 """
 日内做T（正T vs 反T）期望 + 下行风险控制计算器
-核心改进：
-1. 引入「止盈比率（WIN_GAIN_RATIO）」—— 用收益换胜率
-2. 引入「最大可容忍单情景亏损（MAX_ALLOWED_LOSS）」—— 硬性止损约束
-3. 输出中包含「下行风险审计」，超标自动报警
-4. 独立输出「正T日内最大亏损」与「反T日内最大亏损」
-5. 【重要修正】正T和反T分别使用独立的失败惩罚系数，使最大亏损有实际区分度
+最终完整版
+
+核心规则：
+1. 高开回落（情景②③）：无论正T反T，失败时仍可获得保底利润（高开红利）。
+2. 单边趋势（情景①⑤）：失败亏损 = 振幅 × 惩罚系数（极端风险）。
+3. 其他情景（情景④及未分类）：失败亏损 = 固定止损值（纠错纪律）。
+4. 成功盈利始终 = 振幅 × 止盈比率 (WIN_GAIN_RATIO)。
+5. 输出包含各情景明细、总体期望、日内最大亏损、风险审计及纠错提示。
 """
 
-########### 公用参数（全局默认，通常不变）##########################
+########### 公用参数（全局默认，可根据需要修改）##########################
 # ---------- 1. 振幅推导参数 ----------
-AMPLITUDE_FACTOR = 1.5
-BASE_AMPLITUDE = 0.01
+AMPLITUDE_FACTOR = 1.5          # 振幅 = |持仓盈亏| × factor + base
+BASE_AMPLITUDE = 0.01           # 基础振幅（1%）
 
-# ---------- 2. 正T成功率（股市经验值） ----------
-LONG_SR_UP = 0.85
-LONG_SR_HIGH_END_HIGH = 0.70
-LONG_SR_HIGH_END_LOW = 0.25
-LONG_SR_LOW_V_UP = 0.80
-LONG_SR_DOWN = 0.10
+# ---------- 2. 正T成功率（股市经验值，可调整） ----------
+LONG_SR_UP = 0.85               # 单边上涨
+LONG_SR_HIGH_END_HIGH = 0.70    # 高开回落收涨
+LONG_SR_HIGH_END_LOW = 0.25     # 高开回落收跌
+LONG_SR_LOW_V_UP = 0.80         # V型反转
+LONG_SR_DOWN = 0.10             # 单边下跌
 
-# ---------- 3. 反T成功率（股市经验值） ----------
+# ---------- 3. 反T成功率（股市经验值，可调整） ----------
 SHORT_SR_UP = 0.15
 SHORT_SR_HIGH_END_HIGH = 0.30
 SHORT_SR_HIGH_END_LOW = 0.75
 SHORT_SR_LOW_V_UP = 0.20
 SHORT_SR_DOWN = 0.90
 
-# ---------- 4. 失败惩罚系数（亏损幅度 = 振幅 × 惩罚） ----------
-# 正T失败时亏损比例（通常正T在下跌市中亏损较大，故系数可设高一些）
+# ---------- 4. 失败惩罚系数（仅用于单边趋势） ----------
+# 正T在单边下跌中失败亏损 = 振幅 × LONG_FAILURE_PENALTY
 LONG_FAILURE_PENALTY = 0.7
-# 反T失败时亏损比例（反T在上涨市中亏损较大，但整体风险相对可控，系数可设低一些）
-SHORT_FAILURE_PENALTY = 0.2   # 如果卖飞能立即在+1.6%内追回
+# 反T在单边上涨中失败亏损 = 振幅 × SHORT_FAILURE_PENALTY
+SHORT_FAILURE_PENALTY = 0.4
+
+# ---------- 5. 固定止损值（用于非单边、非高开情景） ----------
+LONG_FAILURE_LOSS_FIXED = 0.03      # 正T固定止损 -3%
+SHORT_FAILURE_LOSS_FIXED = 0.01    # 反T固定止损 -0.5%（卖飞追回成本）
+
+# ---------- 6. 高开回落保底利润系数（占振幅的比例） ----------
+HIGH_GAP_GUARANTEE_RATIO = 0.25     # 高开红利通常占振幅的25%
 
 
 def calc_t_with_risk_control(
@@ -67,8 +76,11 @@ def calc_t_with_risk_control(
     short_sr_high_end_low: float,
     short_sr_low_v_up: float,
     short_sr_down: float,
-    long_failure_penalty: float,    # 正T失败惩罚系数
-    short_failure_penalty: float,   # 反T失败惩罚系数
+    long_failure_penalty: float,        # 正T单边失败惩罚
+    short_failure_penalty: float,       # 反T单边失败惩罚
+    long_failure_loss_fixed: float,     # 正T固定止损
+    short_failure_loss_fixed: float,    # 反T固定止损
+    high_gap_guarantee_ratio: float,    # 高开保底系数
 
 ) -> dict:
     """
@@ -91,36 +103,50 @@ def calc_t_with_risk_control(
         ("单边下跌", hold_return_down, long_sr_down, short_sr_down, p5),
     ]
 
-    # ---------- 3. 计算各情景收益（加入 win_gain_ratio） ----------
+    # ---------- 3. 计算各情景收益（核心逻辑） ----------
     long_exp_list = []
     short_exp_list = []
     details = []
-
-    # 用于下行风险审计的列表
     long_worst_losses = []
     short_worst_losses = []
 
     for name, hold_ret, long_sr, short_sr, prob in scenarios:
         amplitude = abs(hold_ret) * amplitude_factor + base_amplitude
-
-        # 成功盈利 = 振幅 × win_gain_ratio（只吃一部分）
         gain_take = amplitude * win_gain_ratio
 
-        # 失败亏损分别使用各自的惩罚系数
-        long_loss_take = amplitude * long_failure_penalty
-        short_loss_take = amplitude * short_failure_penalty
+        # 判断情景类型
+        is_high_gap = "高开回落" in name
+        is_single_trend = ("单边上涨" in name) or ("单边下跌" in name)
 
-        # 正T期望
-        long_exp = long_sr * gain_take - (1 - long_sr) * long_loss_take
-        # 反T期望
-        short_exp = short_sr * gain_take - (1 - short_sr) * short_loss_take
+        if is_high_gap:
+            # 高开回落：保底利润
+            base_profit = amplitude * high_gap_guarantee_ratio
+            long_exp = long_sr * gain_take + (1 - long_sr) * base_profit
+            long_worst = base_profit
+            short_exp = short_sr * gain_take + (1 - short_sr) * base_profit
+            short_worst = base_profit
+
+        elif is_single_trend:
+            # 单边趋势：使用振幅 × 惩罚系数
+            long_loss_take = amplitude * long_failure_penalty
+            short_loss_take = amplitude * short_failure_penalty
+
+            long_exp = long_sr * gain_take - (1 - long_sr) * long_loss_take
+            long_worst = -long_loss_take if long_sr < 1 else 0
+
+            short_exp = short_sr * gain_take - (1 - short_sr) * short_loss_take
+            short_worst = -short_loss_take if short_sr < 1 else 0
+
+        else:
+            # 其他情景（V型、震荡等）：固定止损
+            long_exp = long_sr * gain_take - (1 - long_sr) * long_failure_loss_fixed
+            long_worst = -long_failure_loss_fixed if long_sr < 1 else 0
+
+            short_exp = short_sr * gain_take - (1 - short_sr) * short_failure_loss_fixed
+            short_worst = -short_failure_loss_fixed if short_sr < 1 else 0
 
         long_exp_list.append(long_exp)
         short_exp_list.append(short_exp)
-
-        # 记录最坏情况亏损（即该情景下失败时的损失）
-        long_worst = -long_loss_take if long_sr < 1 else 0
-        short_worst = -short_loss_take if short_sr < 1 else 0
         long_worst_losses.append(long_worst)
         short_worst_losses.append(short_worst)
 
@@ -148,7 +174,7 @@ def calc_t_with_risk_control(
     long_risk_warning = long_worst_overall < max_allowed_loss
     short_risk_warning = short_worst_overall < max_allowed_loss
 
-    # ---------- 6. 综合决策 ----------
+    # ---------- 6. 综合决策（含风险约束） ----------
     if long_risk_warning and short_risk_warning:
         best = "❌ 两者均存在超标风险，建议空仓观望"
         best_exp = 0
@@ -258,12 +284,11 @@ def print_results(result: dict) -> None:
     for k, v in result["总体期望"].items():
         print(f"  {k}: {v}")
 
-    # 高亮输出最大亏损（此时应已不同）
     print("\n" + "-" * 70)
     print("🔥 【日内最大潜在亏损（最坏情景压力测试）】")
     print(f"  正T（先买后卖）日内最大亏损：{result['正T日内最大亏损']}")
     print(f"  反T（先卖后买）日内最大亏损：{result['反T日内最大亏损']}")
-    print(f"  注：正T和反T使用了不同的失败惩罚系数（分别为 {LONG_FAILURE_PENALTY:.1f} 和 {SHORT_FAILURE_PENALTY:.1f}），因此数值可能不同。")
+    print("  注：单边趋势使用振幅×惩罚系数，其他情景使用固定止损值，高开回落有保底利润。")
 
     print("\n" + "-" * 70)
     print("🛡️ 下行风险审计（逐项检查）：")
@@ -284,46 +309,38 @@ def print_results(result: dict) -> None:
     print("说明：")
     print("  1. 止盈比率（win_gain_ratio）越低，成功目标越容易达到，胜率越高，但每笔盈利减少。")
     print("  2. 「日内最大亏损」是判断策略生存能力的最核心指标，若超过账户承受极限，直接否决。")
-    print("  3. 正T和反T的失败亏损系数独立设置，可分别调整以匹配实际交易中的风险特征。")
-    print("  4. 决策顺序：先压测 → 再比期望 → 最后给方向。")
+    print("  3. 高开回落情景下有保底利润，失败时仍为正收益。")
+    print("  4. 单边趋势使用惩罚系数计算极端亏损，其他情景使用固定止损。")
+    print("  5. 决策顺序：先压测 → 再比期望 → 最后给方向。")
     print("=" * 70)
 
 
-# ================= 所有参数在此集中配置 =================
+# ================= 所有参数在此集中配置（你只需修改这部分） =================
 if __name__ == "__main__":
     # ---------- 1. 五类走势的概率 ----------
     # 注：各项概率之和应约等于1，脚本会自动归一化处理。
-    # P_UP：单边上涨概率（开盘即涨，全天无显著回调，收盘创日内新高或接近新高）
-    P_UP = 0.6
+    # P_UP：单边上涨概率（开盘即涨，全天无显著回调，收盘创日内新高或接近新高），高位震荡
+    P_UP = 0.20
     # P_OPEN_HIGH_END_HIGH：先涨后跌，尾盘收涨（高于开盘价）的概率
-    # 即早盘冲高，盘中回落，但收盘价仍高于开盘价
-    P_OPEN_HIGH_END_HIGH = 0.0
+    P_OPEN_HIGH_END_HIGH = 0.50
     # P_OPEN_HIGH_END_LOW：先涨后跌，尾盘收跌（低于开盘价）的概率
-    # 即早盘冲高，盘中回落，收盘价低于开盘价（假突破）
     P_OPEN_HIGH_END_LOW = 0.25
     # P_OPEN_LOW_V_UP：先跌后涨（V型反转）的概率
-    # 即早盘下挫，盘中V型拉起，收盘价高于开盘价或持平
     P_OPEN_LOW_V_UP = 0.00
-    # P_DOWN：单边下跌概率（开盘即跌，全天无显著反弹，收盘创日内新低或接近新低）
-    P_DOWN = 0.15
+    # P_DOWN：单边下跌概率（开盘即跌，全天无显著反弹，收盘创日内新低）
+    P_DOWN = 0.05
 
     # ---------- 2. 五类走势的「持仓不动」盈亏比例 ----------
-    # 注：这里的盈亏比例是指「若该走势发生，仅持有底仓不做任何T操作，账户的当日盈亏比例」。
     # 正值表示盈利，负值表示亏损，输入小数（如0.10表示+10%，-0.08表示-8%）。
-    # HOLD_RET_UP：单边上涨情景下的持仓盈亏比例
-    HOLD_RET_UP = 0.10
-    # HOLD_RET_HIGH_END_HIGH：先涨后跌、尾盘收涨情景下的持仓盈亏比例
-    HOLD_RET_HIGH_END_HIGH = 0.06
-    # HOLD_RET_HIGH_END_LOW：先涨后跌、尾盘收跌情景下的持仓盈亏比例（通常为负）
-    HOLD_RET_HIGH_END_LOW = -0.08
-    # HOLD_RET_LOW_V_UP：先跌后涨（V型反转）情景下的持仓盈亏比例（通常为正或微亏）
+    HOLD_RET_UP = 0.08
+    HOLD_RET_HIGH_END_HIGH = 0.02
+    HOLD_RET_HIGH_END_LOW = -0.02
     HOLD_RET_LOW_V_UP = 0.00
-    # HOLD_RET_DOWN：单边下跌情景下的持仓盈亏比例（通常为负）
-    HOLD_RET_DOWN = -0.08
+    HOLD_RET_DOWN = -0.035
 
     # ---------- 3. 风险控制参数 ----------
-    WIN_GAIN_RATIO = 1          # 止盈比率：成功时抓取振幅的比例（1表示全吃，0.5表示只吃一半）
-    MAX_ALLOWED_LOSS = -0.1     # 最大可容忍单情景亏损（例如-0.1表示最多亏10%）
+    WIN_GAIN_RATIO = 1          # 成功时抓取全部振幅
+    MAX_ALLOWED_LOSS = -0.1     # 最大可容忍单情景亏损 -10%
 
     # ========== 调用计算 ==========
     result = calc_t_with_risk_control(
@@ -359,6 +376,9 @@ if __name__ == "__main__":
 
         long_failure_penalty=LONG_FAILURE_PENALTY,
         short_failure_penalty=SHORT_FAILURE_PENALTY,
+        long_failure_loss_fixed=LONG_FAILURE_LOSS_FIXED,
+        short_failure_loss_fixed=SHORT_FAILURE_LOSS_FIXED,
+        high_gap_guarantee_ratio=HIGH_GAP_GUARANTEE_RATIO,
     )
 
     print_results(result)
