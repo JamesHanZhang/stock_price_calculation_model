@@ -1,5 +1,5 @@
-import pandas as pd
 import numpy as np
+
 
 class PegPredictionModel():
     def __init__(self):
@@ -11,22 +11,30 @@ class PegPredictionModel():
             'PEG=0.8时的股价预测值', 'PEG=1时的股价预测值', 'PEG=1.2时的股价预测值', '备注'
         ]
 
-    def main(self, df):
-        df[self.new_column_lists] = df.apply(self.apply_wrapper, axis=1)
-        return df
+    @staticmethod
+    def _is_na(val):
+        """检查值是否为空（None或NaN）"""
+        if val is None:
+            return True
+        try:
+            return bool(np.isnan(val))
+        except (TypeError, ValueError):
+            return False
 
-    def process_rows(self, row_df):
+    def process_row(self, row):
         """
         核心处理逻辑（均值回归衰减模型 + 全修正 + 三级增速预警）
+        输入: dict（单行数据）
+        输出: dict（仅含 new_column_lists 中的输出字段）
         """
-        stock_name = row_df["股票名称"].iloc[0]
-        current_quarter = int(row_df["当前季度"].iloc[0])
+        stock_name = row["股票名称"]
+        current_quarter = int(row["当前季度"])
 
         # ---------- 1. 提取历史季度数据 ----------
         quarters_NPAT = []
         years_NPAT = []
         for q in range(12):
-            val = row_df[f"TTM{q + 1}扣非归母净利润"].iloc[0]
+            val = row[f"TTM{q + 1}扣非归母净利润"]
             quarters_NPAT.append(val)
             if (q + 1) % 4 == 0:
                 year_sum = quarters_NPAT[q - 3] + quarters_NPAT[q - 2] + quarters_NPAT[q - 1] + quarters_NPAT[q]
@@ -64,9 +72,9 @@ class PegPredictionModel():
         # 计算加速度（用于输出参考，不参与预测）
         sequential_growth_contrast = current_qoq - hist_mean_qoq
 
-        # 衰减半衰期（从Excel读取，若无则默认1.5）
-        decay_T = row_df["增速半衰周期"].iloc[0]
-        if pd.isna(decay_T) or decay_T <= 0:
+        # 衰减半衰期（从输入读取，若无则默认1.5）
+        decay_T = row["增速半衰周期"]
+        if self._is_na(decay_T) or decay_T <= 0:
             decay_T = 1.5
 
         # 逐季预测未来4个季度环比增速（指数衰减回归至历史均值）
@@ -89,15 +97,15 @@ class PegPredictionModel():
 
         # ---------- 3. 研报数据读取（预处理） ----------
         broker_research_repo_discount = 0.15
-        value = row_df["研报数"].iloc[0]
-        broker_research_repo_num = int(value) if pd.notna(value) else 0
+        value = row["研报数"]
+        broker_research_repo_num = int(value) if not self._is_na(value) else 0
 
         if broker_research_repo_num > 0:
             current_year_predicted_PAT = []
             next_year_predicted_PAT = []
             for b in range(broker_research_repo_num):
-                current_year_predicted_PAT.append(float(row_df[f"研报{b + 1}的本年度预测归母净利润"].iloc[0]))
-                next_year_predicted_PAT.append(float(row_df[f"研报{b + 1}的下一年预测归母净利润"].iloc[0]))
+                current_year_predicted_PAT.append(float(row[f"研报{b + 1}的本年度预测归母净利润"]))
+                next_year_predicted_PAT.append(float(row[f"研报{b + 1}的下一年预测归母净利润"]))
 
             # 加权平均（当前年剩余季度和明年季度加权）
             repo_mean = (sum(current_year_predicted_PAT) * (4 - current_quarter) / 4 +
@@ -145,7 +153,7 @@ class PegPredictionModel():
                     if len(ratios) >= 2:
                         avg_h1_ratio = np.mean(ratios)
                         annualized_by_h1 = h1_0 / avg_h1_ratio if avg_h1_ratio > 0 else np.nan
-                        if not np.isnan(annualized_by_h1) and annualized_by_h1 > 0:
+                        if not self._is_na(annualized_by_h1) and annualized_by_h1 > 0:
                             next_year_NPAT = min(model_NPAT, annualized_by_h1)
                             no_repo_remark = "无研报覆盖，采用半年报年化保守值"
                         else:
@@ -160,25 +168,24 @@ class PegPredictionModel():
         predicted_next_year_NPAT = next_year_NPAT
 
         # ---------- 5. 计算EPS和增长率 ----------
-        total_share_capital = row_df["总股本"].iloc[0]
+        total_share_capital = row["总股本"]
         if total_share_capital <= 0:
-            return self._return_nan_series(broker_research_repo_discount, confidence_lv, repo_PAT_low, repo_PAT_high,
+            return self._return_nan_result(broker_research_repo_discount, confidence_lv, repo_PAT_low, repo_PAT_high,
                                            sequential_growth_contrast, 0, remark="总股本异常")
 
         next_year_EPS = predicted_next_year_NPAT / total_share_capital
 
-
         lst_year_NPAT = years_NPAT[0] - quarters_NPAT[0] + quarters_NPAT[4]
 
         if lst_year_NPAT <= 0:
-            return self._return_nan_series(broker_research_repo_discount, confidence_lv, repo_PAT_low, repo_PAT_high,
+            return self._return_nan_result(broker_research_repo_discount, confidence_lv, repo_PAT_low, repo_PAT_high,
                                            sequential_growth_contrast, 0, remark="上年利润非正，PEG分母无效")
 
         growth_rate = (predicted_next_year_NPAT - lst_year_NPAT) / lst_year_NPAT
 
         # ---------- 6. 处理负增长（硬失效） ----------
         if growth_rate <= 0:
-            return self._return_nan_series(broker_research_repo_discount, confidence_lv, repo_PAT_low, repo_PAT_high,
+            return self._return_nan_result(broker_research_repo_discount, confidence_lv, repo_PAT_low, repo_PAT_high,
                                            sequential_growth_contrast, 0, remark="负增长/零增长，PEG失效，请用PB或EV/EBITDA")
 
         # ---------- 7. 三级增速预警与硬失效机制 ----------
@@ -187,7 +194,7 @@ class PegPredictionModel():
             warn_remarks = "增速>100%，PEG数学意义失真（PE>100倍），建议改用DCF或EV/EBITDA"
             if no_repo_remark:
                 warn_remarks += "；" + no_repo_remark
-            return self._return_nan_series(broker_research_repo_discount, confidence_lv, repo_PAT_low, repo_PAT_high,
+            return self._return_nan_result(broker_research_repo_discount, confidence_lv, repo_PAT_low, repo_PAT_high,
                                            sequential_growth_contrast, 0, remark=warn_remarks)
 
         # 软警告：增速在 50%~100% 之间
@@ -205,15 +212,13 @@ class PegPredictionModel():
         else:
             volatility_remark = ""
 
-        # ---------- 14. 龙头软警告（仅当股票不是龙头自身） ----------
-        # 获取行业龙头名称
-        industry_leader_name = row_df.get("行业龙头", [""]).iloc[0] if "行业龙头" in row_df.columns else ""
+        # ---------- 9. 龙头软警告（仅当股票不是龙头自身） ----------
+        industry_leader_name = row.get("行业龙头", "")
         if stock_name == industry_leader_name:
             leader_remark = ""  # 自身不比较
         else:
-            leader_growth_rate = row_df.get("行业龙头年增长率", [np.nan]).iloc[
-                0] if "行业龙头年增长率" in row_df.columns else np.nan
-            if not pd.isna(leader_growth_rate) and growth_rate > leader_growth_rate * 1.8:
+            leader_growth_rate = row.get("行业龙头年增长率", np.nan)
+            if not self._is_na(leader_growth_rate) and growth_rate > leader_growth_rate * 1.8:
                 leader_remark = f"增速({growth_rate:.1%})远超龙头({leader_growth_rate:.1%})，需验证阿尔法真实性"
             else:
                 leader_remark = ""
@@ -242,11 +247,11 @@ class PegPredictionModel():
         share_price_PEG120 = round(PE_PEG120 * next_year_EPS, 2)
 
         # 综合景气度（仅输出）
-        industry_MoM_rate = row_df["当前季度同行业的同比增速"].iloc[0]
+        industry_MoM_rate = row["当前季度同行业的同比增速"]
         integrated_bustling_rate = 0.7 * sequential_growth_contrast + 0.3 * industry_MoM_rate
 
         # ---------- 12. 返回结果 ----------
-        return pd.Series({
+        return {
             '机构估值折价': broker_research_repo_discount,
             '机构置信区间': confidence_lv,
             '机构预测的未来一年归母净利润下限': round(repo_PAT_low, 3),
@@ -262,11 +267,11 @@ class PegPredictionModel():
             'PEG=1时的股价预测值': share_price_PEG100,
             'PEG=1.2时的股价预测值': share_price_PEG120,
             '备注': final_remark
-        })
+        }
 
-    def _return_nan_series(self, discount, conf, low, high, contrast, bustling, remark):
-        """辅助函数：返回全NaN的Series（用于PEG失效场景）"""
-        return pd.Series({
+    def _return_nan_result(self, discount, conf, low, high, contrast, bustling, remark):
+        """辅助函数：返回全NaN的dict（用于PEG失效场景）"""
+        return {
             '机构估值折价': discount,
             '机构置信区间': conf,
             '机构预测的未来一年归母净利润下限': round(low, 3),
@@ -282,8 +287,4 @@ class PegPredictionModel():
             'PEG=1时的股价预测值': np.nan,
             'PEG=1.2时的股价预测值': np.nan,
             '备注': remark
-        })
-
-    def apply_wrapper(self, row_series):
-        row_df = row_series.to_frame().T
-        return self.process_rows(row_df)
+        }
